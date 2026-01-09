@@ -15,6 +15,7 @@ RUN_DOWNLOAD="${RUN_DOWNLOAD:-1}"
 MEM_SAMPLE_SECS="${MEM_SAMPLE_SECS:-0.2}"
 MEM_LOG="${MEM_LOG:-${ROOT_DIR}/.interop/mem-rust-rust-$(date +%Y%m%d_%H%M%S).csv}"
 MAX_RSS_MB="${MAX_RSS_MB:-80}"
+MIN_AVG_MIB_S="${MIN_AVG_MIB_S:-0}"
 
 mkdir -p "$(dirname "${MEM_LOG}")"
 
@@ -30,6 +31,7 @@ RUN_EXFIL="${RUN_EXFIL}" \
 RUN_DOWNLOAD="${RUN_DOWNLOAD}" \
 TRANSFER_BYTES="${TRANSFER_BYTES}" \
 SOCKET_TIMEOUT="${SOCKET_TIMEOUT}" \
+MIN_AVG_MIB_S="${MIN_AVG_MIB_S}" \
 DNS_LISTEN_PORT="${DNS_LISTEN_PORT}" \
 TCP_TARGET_PORT="${TCP_TARGET_PORT}" \
 CLIENT_TCP_PORT="${CLIENT_TCP_PORT}" \
@@ -38,14 +40,26 @@ BENCH_PID=$!
 
 server_pid=""
 client_pid=""
-for _ in $(seq 1 200); do
-  server_pid=$(pgrep -f "slipstream-server.*--dns-listen-port ${DNS_LISTEN_PORT}" | head -n1 || true)
-  client_pid=$(pgrep -f "slipstream-client.*--tcp-listen-port ${CLIENT_TCP_PORT}" | head -n1 || true)
+while kill -0 "${BENCH_PID}" 2>/dev/null; do
+  server_pid=$(pgrep -n -f "slipstream-server.*--dns-listen-port ${DNS_LISTEN_PORT}" || true)
+  client_pid=$(pgrep -n -f "slipstream-client.*--tcp-listen-port ${CLIENT_TCP_PORT}" || true)
+  if [[ -z "${server_pid}" ]]; then
+    server_pid=$(pgrep -n -f "slipstream-server" || true)
+  fi
+  if [[ -z "${client_pid}" ]]; then
+    client_pid=$(pgrep -n -f "slipstream-client" || true)
+  fi
   if [[ -n "${server_pid}" && -n "${client_pid}" ]]; then
     break
   fi
-  sleep 0.05
+  sleep 0.1
 done
+
+if [[ -z "${server_pid}" || -z "${client_pid}" ]]; then
+  echo "Failed to locate slipstream server/client PIDs for RSS sampling." >&2
+  wait "${BENCH_PID}" 2>/dev/null || true
+  exit 1
+fi
 
 printf "ts_ms,server_rss_kb,client_rss_kb\n" > "${MEM_LOG}"
 while kill -0 "${BENCH_PID}" 2>/dev/null; do

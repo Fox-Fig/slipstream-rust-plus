@@ -18,6 +18,7 @@ Benchmark harnesses live under scripts/bench and write artifacts under .interop/
   for both exfil and download.
 - The Rust <-> Rust memory sampler enforces MAX_RSS_MB (default 80). Set MAX_RSS_MB=0
   to disable the threshold.
+- The memory sampler defaults MIN_AVG_MIB_S=0 so bandwidth checks are disabled unless overridden.
 
 ## Timing and delay injection
 
