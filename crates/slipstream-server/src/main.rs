@@ -1,4 +1,6 @@
 mod server;
+mod streams;
+mod target;
 
 use clap::Parser;
 use server::{run_server, ServerConfig};
