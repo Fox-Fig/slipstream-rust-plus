@@ -1,4 +1,3 @@
-use slipstream_core::tcp::stream_write_buffer_bytes;
 use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_TXT};
 use slipstream_ffi::{
     configure_quic,
@@ -7,7 +6,7 @@ use slipstream_ffi::{
         picoquic_connection_id_t, picoquic_create, picoquic_create_client_cnx,
         picoquic_current_time, picoquic_disable_keep_alive, picoquic_enable_keep_alive,
         picoquic_get_next_wake_delay, picoquic_prepare_next_packet_ex, picoquic_set_callback,
-        picoquic_set_max_data_control, slipstream_has_ready_stream, slipstream_is_flow_blocked,
+        slipstream_has_ready_stream, slipstream_is_flow_blocked,
         PICOQUIC_CONNECTION_ID_MAX_SIZE, PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX,
         PICOQUIC_PACKET_LOOP_SEND_MAX,
     },
@@ -41,7 +40,6 @@ const SLIPSTREAM_SNI: &str = "test.example.com";
 const DNS_WAKE_DELAY_MAX_US: i64 = 10_000_000;
 const DNS_POLL_SLICE_US: u64 = 50_000;
 const AUTHORITATIVE_LOOP_MULTIPLIER: usize = 4;
-const AUTHORITATIVE_MAX_DATA_MULTIPLIER: usize = 4;
 
 #[derive(Debug)]
 pub struct ClientError {
@@ -131,14 +129,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     if let Some(cert) = config.cert {
         configure_pinned_certificate(quic, cert).map_err(ClientError::new)?;
     }
-    if config.authoritative {
-        let max_data =
-            stream_write_buffer_bytes().saturating_mul(AUTHORITATIVE_MAX_DATA_MULTIPLIER);
-        unsafe {
-            picoquic_set_max_data_control(quic, max_data as u64);
-        }
-    }
-
     let mut server_storage = resolvers[0].storage;
     // picoquic_create_client_cnx calls picoquic_start_client_cnx internally (see picoquic/quicctx.c).
     let cnx = unsafe {
