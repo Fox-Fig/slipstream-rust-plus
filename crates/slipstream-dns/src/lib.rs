@@ -1,14 +1,20 @@
 mod base32;
-mod dns;
+mod codec;
 mod dots;
+mod name;
+mod types;
+mod wire;
 
 pub use base32::{decode as base32_decode, encode as base32_encode, Base32Error};
-pub use dns::{
+pub use codec::{
     decode_query, decode_query_with_domains, decode_response, encode_query, encode_response,
-    is_response, DecodeQueryError, DecodedQuery, DnsError, QueryParams, Question, Rcode,
-    ResponseParams, CLASS_IN, EDNS_UDP_PAYLOAD, RR_A, RR_OPT, RR_TXT,
+    is_response,
 };
 pub use dots::{dotify, undotify};
+pub use types::{
+    DecodeQueryError, DecodedQuery, DnsError, QueryParams, Question, Rcode, ResponseParams,
+    CLASS_IN, EDNS_UDP_PAYLOAD, RR_A, RR_OPT, RR_TXT,
+};
 
 pub fn build_qname(payload: &[u8], domain: &str) -> Result<String, DnsError> {
     let domain = domain.trim_end_matches('.');
@@ -29,10 +35,10 @@ pub fn max_payload_len_for_domain(domain: &str) -> Result<usize, DnsError> {
     if domain.is_empty() {
         return Err(DnsError::new("domain must not be empty"));
     }
-    if domain.len() > dns::MAX_DNS_NAME_LEN {
+    if domain.len() > name::MAX_DNS_NAME_LEN {
         return Err(DnsError::new("domain too long"));
     }
-    let max_name_len = dns::MAX_DNS_NAME_LEN;
+    let max_name_len = name::MAX_DNS_NAME_LEN;
     let max_dotted_len = max_name_len.saturating_sub(domain.len() + 1);
     if max_dotted_len == 0 {
         return Ok(0);
