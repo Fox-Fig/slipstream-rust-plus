@@ -34,6 +34,24 @@ fn idle_gc_closes_connection() {
             return;
         }
     };
+    let mut recovery_tcp_port = None;
+    for _ in 0..10 {
+        match pick_tcp_port() {
+            Ok(port) if port != tcp_port => {
+                recovery_tcp_port = Some(port);
+                break;
+            }
+            Ok(_) => continue,
+            Err(err) => {
+                eprintln!("skipping idle gc e2e test: {}", err);
+                return;
+            }
+        }
+    }
+    let Some(recovery_tcp_port) = recovery_tcp_port else {
+        eprintln!("skipping idle gc e2e test: could not find distinct TCP port");
+        return;
+    };
     let domain = "test.example.com";
 
     let (mut server, server_logs) = spawn_server(ServerArgs {
@@ -87,6 +105,30 @@ fn idle_gc_closes_connection() {
     ) {
         let snapshot = log_snapshot(&server_logs);
         panic!("expected idle gc close log\n{}", snapshot);
+    }
+
+    let (_recovery_client, recovery_logs) = spawn_client(ClientArgs {
+        client_bin: &client_bin,
+        dns_port,
+        tcp_port: recovery_tcp_port,
+        domain,
+        cert: Some(&cert),
+        keep_alive_interval: Some(0),
+        rust_log: "info",
+        capture_logs: true,
+    });
+    let recovery_logs = recovery_logs.expect("recovery client logs");
+    if !wait_for_log(
+        &recovery_logs,
+        "Listening on TCP port",
+        Duration::from_secs(5),
+    ) {
+        let snapshot = log_snapshot(&recovery_logs);
+        panic!("recovery client did not start listening\n{}", snapshot);
+    }
+    if !wait_for_log(&recovery_logs, "Connection ready", Duration::from_secs(10)) {
+        let snapshot = log_snapshot(&recovery_logs);
+        panic!("recovery client did not become ready\n{}", snapshot);
     }
 
     let payload = [0u8; 128];
