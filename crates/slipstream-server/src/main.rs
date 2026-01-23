@@ -61,35 +61,21 @@ fn main() {
         tracing::info!("SIP003 env detected; applying SS_* overrides with CLI precedence");
     }
 
-    let sip003_remote = if !cli_provided(&matches, "dns_listen_host")
-        && !cli_provided(&matches, "dns_listen_port")
-    {
-        sip003::parse_endpoint(
-            sip003_env.remote_host.as_deref(),
-            sip003_env.remote_port.as_deref(),
-            "SS_REMOTE",
-        )
-        .unwrap_or_else(|err| {
-            tracing::error!("SIP003 env error: {}", err);
-            std::process::exit(2);
-        })
-    } else {
-        None
-    };
-    let dns_listen_host = if cli_provided(&matches, "dns_listen_host") {
-        args.dns_listen_host.clone()
-    } else if let Some(endpoint) = &sip003_remote {
-        endpoint.host.clone()
-    } else {
-        args.dns_listen_host.clone()
-    };
-    let dns_listen_port = if cli_provided(&matches, "dns_listen_port") {
-        args.dns_listen_port
-    } else if let Some(endpoint) = &sip003_remote {
-        endpoint.port
-    } else {
-        args.dns_listen_port
-    };
+    let dns_listen_host_provided = cli_provided(&matches, "dns_listen_host");
+    let dns_listen_port_provided = cli_provided(&matches, "dns_listen_port");
+    let (dns_listen_host, dns_listen_port) = sip003::select_host_port(
+        &args.dns_listen_host,
+        args.dns_listen_port,
+        dns_listen_host_provided,
+        dns_listen_port_provided,
+        sip003_env.remote_host.as_deref(),
+        sip003_env.remote_port.as_deref(),
+        "SS_REMOTE",
+    )
+    .unwrap_or_else(|err| {
+        tracing::error!("SIP003 env error: {}", err);
+        std::process::exit(2);
+    });
 
     let sip003_local = if cli_provided(&matches, "target_address") {
         None
@@ -117,7 +103,7 @@ fn main() {
     let fallback_address = if cli_provided(&matches, "fallback") {
         args.fallback.clone()
     } else {
-        last_option_value(&sip003_env.plugin_options, "fallback").map(|value| {
+        sip003::last_option_value(&sip003_env.plugin_options, "fallback").map(|value| {
             parse_fallback_address(&value).unwrap_or_else(|err| {
                 tracing::error!("SIP003 env error: {}", err);
                 std::process::exit(2);
@@ -142,7 +128,7 @@ fn main() {
 
     let cert = if let Some(cert) = args.cert.clone() {
         cert
-    } else if let Some(cert) = last_option_value(&sip003_env.plugin_options, "cert") {
+    } else if let Some(cert) = sip003::last_option_value(&sip003_env.plugin_options, "cert") {
         cert
     } else {
         tracing::error!("A certificate path is required");
@@ -151,7 +137,7 @@ fn main() {
 
     let key = if let Some(key) = args.key.clone() {
         key
-    } else if let Some(key) = last_option_value(&sip003_env.plugin_options, "key") {
+    } else if let Some(key) = sip003::last_option_value(&sip003_env.plugin_options, "key") {
         key
     } else {
         tracing::error!("A key path is required");
@@ -160,11 +146,13 @@ fn main() {
     let reset_seed_path = if let Some(path) = args.reset_seed.clone() {
         Some(path)
     } else {
-        last_option_value(&sip003_env.plugin_options, "reset-seed")
+        sip003::last_option_value(&sip003_env.plugin_options, "reset-seed")
     };
     let max_connections = if cli_provided(&matches, "max_connections") {
         args.max_connections
-    } else if let Some(value) = last_option_value(&sip003_env.plugin_options, "max-connections") {
+    } else if let Some(value) =
+        sip003::last_option_value(&sip003_env.plugin_options, "max-connections")
+    {
         parse_max_connections(&value).unwrap_or_else(|err| {
             tracing::error!("SIP003 env error: {}", err);
             std::process::exit(2);
@@ -259,14 +247,4 @@ fn parse_domains_from_options(options: &[sip003::Sip003Option]) -> Result<Vec<St
         }
     }
     Ok(domains.unwrap_or_default())
-}
-
-fn last_option_value(options: &[sip003::Sip003Option], key: &str) -> Option<String> {
-    let mut last = None;
-    for option in options {
-        if option.key == key {
-            last = Some(option.value.trim().to_string());
-        }
-    }
-    last
 }

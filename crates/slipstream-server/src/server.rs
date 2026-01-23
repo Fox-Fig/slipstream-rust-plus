@@ -1,6 +1,8 @@
 use crate::config::{ensure_cert_key, load_or_create_reset_seed, ResetSeed};
 use crate::udp_fallback::{handle_packet, FallbackManager, PacketContext, MAX_UDP_PACKET_SIZE};
-use slipstream_core::{net::is_transient_udp_error, resolve_host_port, HostPort};
+use slipstream_core::{
+    net::is_transient_udp_error, normalize_dual_stack_addr, resolve_host_port, HostPort,
+};
 use slipstream_dns::{encode_response, Question, Rcode, ResponseParams};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_create, picoquic_current_time, picoquic_delete_cnx,
@@ -14,7 +16,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt;
-use std::net::{SocketAddr, SocketAddrV6};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -474,15 +476,6 @@ fn bind_udp_socket_addr(addr: SocketAddr) -> Result<TokioUdpSocket, ServerError>
     socket.set_nonblocking(true).map_err(map_io)?;
     let std_socket: std::net::UdpSocket = socket.into();
     TokioUdpSocket::from_std(std_socket).map_err(map_io)
-}
-
-pub(crate) fn normalize_dual_stack_addr(addr: SocketAddr) -> SocketAddr {
-    match addr {
-        SocketAddr::V4(v4) => {
-            SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
-        }
-        SocketAddr::V6(v6) => SocketAddr::V6(v6),
-    }
 }
 
 pub(crate) fn map_io(err: std::io::Error) -> ServerError {
