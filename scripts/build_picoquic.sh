@@ -16,6 +16,7 @@ CMAKE_ARGS=(
   "-DCMAKE_BUILD_TYPE=${BUILD_TYPE}"
   "-DPICOQUIC_FETCH_PTLS=${FETCH_PTLS}"
   "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"
+  "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
 )
 
 BUILD_TARGET=()
@@ -81,4 +82,8 @@ if [[ -n "${OPENSSL_USE_STATIC_LIBS:-}" ]]; then
 fi
 
 cmake -S "${PICOQUIC_DIR}" -B "${BUILD_DIR}" "${CMAKE_ARGS[@]}"
-cmake --build "${BUILD_DIR}" "${BUILD_TARGET[@]}"
+if [[ ${#BUILD_TARGET[@]} -gt 0 ]]; then
+  cmake --build "${BUILD_DIR}" "${BUILD_TARGET[@]}"
+else
+  cmake --build "${BUILD_DIR}"
+fi
