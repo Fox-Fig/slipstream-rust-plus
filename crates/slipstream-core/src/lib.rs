@@ -1,12 +1,17 @@
 use std::fmt;
 
 pub mod flow_control;
+pub mod invariants;
 mod macros;
 pub mod net;
 pub mod sip003;
 pub mod stream;
 pub mod tcp;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressFamily {

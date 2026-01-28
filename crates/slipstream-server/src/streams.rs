@@ -5,11 +5,12 @@ use slipstream_core::flow_control::{
     overflow_log_message, promote_error_log_message, promote_streams, reserve_target_offset,
     FlowControlState, HasFlowControlState, PromoteEntry, StreamReceiveConfig, StreamReceiveOps,
 };
+use slipstream_core::invariants::InvariantReporter;
 use slipstream_ffi::picoquic::{
     picoquic_call_back_event_t, picoquic_close, picoquic_close_immediate, picoquic_cnx_t,
-    picoquic_get_first_cnx, picoquic_get_next_cnx, picoquic_mark_active_stream,
-    picoquic_provide_stream_data_buffer, picoquic_quic_t, picoquic_reset_stream,
-    picoquic_stop_sending, picoquic_stream_data_consumed,
+    picoquic_current_time, picoquic_get_first_cnx, picoquic_get_next_cnx,
+    picoquic_mark_active_stream, picoquic_provide_stream_data_buffer, picoquic_quic_t,
+    picoquic_reset_stream, picoquic_stop_sending, picoquic_stream_data_consumed,
 };
 use slipstream_ffi::{abort_stream_bidi, SLIPSTREAM_FILE_CANCEL_ERROR, SLIPSTREAM_INTERNAL_ERROR};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -20,6 +21,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, warn};
 
+static INVARIANT_REPORTER: InvariantReporter = InvariantReporter::new(1_000_000);
+
 pub(crate) struct ServerState {
     target_addr: SocketAddr,
     streams: HashMap<StreamKey, ServerStream>,
@@ -29,6 +32,7 @@ pub(crate) struct ServerState {
     debug_commands: bool,
     command_counts: CommandCounts,
     last_command_report: Instant,
+    last_mark_active_fail_log_at: u64,
 }
 
 #[derive(Default)]
@@ -89,6 +93,7 @@ impl ServerState {
             debug_commands,
             command_counts: CommandCounts::default(),
             last_command_report: Instant::now(),
+            last_mark_active_fail_log_at: 0,
         }
     }
 
@@ -200,6 +205,59 @@ impl ServerState {
             }
         }
         summaries
+    }
+}
+
+fn report_invariant<F>(message: F)
+where
+    F: FnOnce() -> String,
+{
+    let now = unsafe { picoquic_current_time() };
+    INVARIANT_REPORTER.report(now, message, |msg| error!("{}", msg));
+}
+
+fn check_stream_invariants(state: &ServerState, key: StreamKey, context: &str) {
+    let Some(stream) = state.streams.get(&key) else {
+        return;
+    };
+    if stream.close_after_flush && !stream.target_fin_pending {
+        report_invariant(|| {
+            format!(
+                "server invariant violated: close_after_flush without target_fin_pending stream={} context={} queued={} pending_fin={} fin_enqueued={} target_fin_pending={} close_after_flush={}",
+                key.stream_id,
+                context,
+                stream.flow.queued_bytes,
+                stream.pending_fin,
+                stream.fin_enqueued,
+                stream.target_fin_pending,
+                stream.close_after_flush
+            )
+        });
+    }
+    if stream.pending_fin && stream.fin_enqueued {
+        report_invariant(|| {
+            format!(
+                "server invariant violated: pending_fin with fin_enqueued stream={} context={} queued={} pending_chunks={} target_fin_pending={} close_after_flush={}",
+                key.stream_id,
+                context,
+                stream.flow.queued_bytes,
+                stream.pending_data.len(),
+                stream.target_fin_pending,
+                stream.close_after_flush
+            )
+        });
+    }
+    if stream.write_tx.is_some() != stream.send_pending.is_some() {
+        report_invariant(|| {
+            format!(
+                "server invariant violated: write_tx/send_pending mismatch stream={} context={} write_tx={} send_pending={} data_rx={}",
+                key.stream_id,
+                context,
+                stream.write_tx.is_some(),
+                stream.send_pending.is_some(),
+                stream.data_rx.is_some()
+            )
+        });
     }
 }
 
@@ -643,6 +701,8 @@ fn handle_stream_data(
         }
         unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
     }
+
+    check_stream_invariants(state, key, "handle_stream_data");
 }
 
 pub(crate) fn remove_connection_streams(state: &mut ServerState, cnx: usize) {
@@ -746,6 +806,7 @@ pub(crate) fn handle_command(state_ptr: *mut ServerState, command: Command) {
                 shutdown_stream(state, key);
                 unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
             }
+            check_stream_invariants(state, key, "StreamConnected");
         }
         Command::StreamConnectError { cnx_id, stream_id } => {
             let cnx = cnx_id as *mut picoquic_cnx_t;
@@ -763,6 +824,7 @@ pub(crate) fn handle_command(state_ptr: *mut ServerState, command: Command) {
                 cnx: cnx_id,
                 stream_id,
             };
+            let mut remove_stream = false;
             if let Some(stream) = state.streams.get_mut(&key) {
                 stream.target_fin_pending = true;
                 stream.close_after_flush = true;
@@ -776,15 +838,66 @@ pub(crate) fn handle_command(state_ptr: *mut ServerState, command: Command) {
                     pending.store(true, Ordering::SeqCst);
                 }
                 let cnx = cnx_id as *mut picoquic_cnx_t;
+                #[cfg(test)]
+                let forced_failure = test_hooks::take_mark_active_stream_failure();
+                #[cfg(not(test))]
+                let forced_failure = false;
+                #[cfg(test)]
+                let ret = if forced_failure {
+                    test_hooks::FORCED_MARK_ACTIVE_STREAM_ERROR
+                } else {
+                    assert!(
+                        cnx_id >= 0x1000,
+                        "mark_active_stream called with synthetic cnx_id; set test failure counter"
+                    );
+                    unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) }
+                };
+                #[cfg(not(test))]
                 let ret =
                     unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) };
-                if ret != 0 && state.debug_streams {
-                    debug!(
-                        "stream {:?}: mark_active_stream fin failed ret={}",
-                        stream_id, ret
-                    );
+                if ret != 0 {
+                    const MARK_ACTIVE_FAIL_LOG_INTERVAL_US: u64 = 1_000_000;
+                    let now = unsafe { picoquic_current_time() };
+                    if now.saturating_sub(state.last_mark_active_fail_log_at)
+                        >= MARK_ACTIVE_FAIL_LOG_INTERVAL_US
+                    {
+                        let send_pending = stream
+                            .send_pending
+                            .as_ref()
+                            .map(|pending| pending.load(Ordering::SeqCst))
+                            .unwrap_or(false);
+                        let send_stash_bytes = stream
+                            .send_stash
+                            .as_ref()
+                            .map(|stash| stash.len())
+                            .unwrap_or(0);
+                        let backlog = BacklogStreamSummary {
+                            stream_id,
+                            send_pending,
+                            send_stash_bytes,
+                            target_fin_pending: stream.target_fin_pending,
+                            close_after_flush: stream.close_after_flush,
+                            pending_fin: stream.pending_fin,
+                            fin_enqueued: stream.fin_enqueued,
+                            queued_bytes: stream.flow.queued_bytes as u64,
+                            pending_chunks: stream.pending_data.len(),
+                        };
+                        warn!(
+                            "stream {:?}: mark_active_stream fin failed ret={} backlog={:?}",
+                            stream_id, ret, backlog
+                        );
+                        state.last_mark_active_fail_log_at = now;
+                    }
+                    if !forced_failure {
+                        unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+                    }
+                    remove_stream = true;
                 }
             }
+            if remove_stream {
+                shutdown_stream(state, key);
+            }
+            check_stream_invariants(state, key, "StreamClosed");
         }
         Command::StreamReadable { cnx_id, stream_id } => {
             let key = StreamKey {
@@ -895,6 +1008,7 @@ pub(crate) fn handle_command(state_ptr: *mut ServerState, command: Command) {
                     )
                 };
             }
+            check_stream_invariants(state, key, "StreamWriteDrained");
         }
     }
 }
@@ -937,4 +1051,77 @@ pub(crate) fn handle_shutdown(quic: *mut picoquic_quic_t, state: &mut ServerStat
     state.streams.clear();
     state.multi_streams.clear();
     true
+}
+
+#[cfg(test)]
+mod test_hooks {
+    use slipstream_core::test_support::FailureCounter;
+
+    pub(super) const FORCED_MARK_ACTIVE_STREAM_ERROR: i32 = 0x400 + 36;
+    pub(super) static MARK_ACTIVE_STREAM_FAILS_LEFT: FailureCounter = FailureCounter::new();
+
+    pub(super) fn set_mark_active_stream_failures(count: usize) {
+        MARK_ACTIVE_STREAM_FAILS_LEFT.set(count);
+    }
+
+    pub(super) fn take_mark_active_stream_failure() -> bool {
+        MARK_ACTIVE_STREAM_FAILS_LEFT.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slipstream_core::test_support::ResetOnDrop;
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, watch};
+
+    #[test]
+    fn mark_active_stream_failure_should_remove_stream() {
+        let _guard = ResetOnDrop::new(|| test_hooks::set_mark_active_stream_failures(0));
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let target_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mut state = ServerState::new(target_addr, command_tx, false, false);
+        let key = StreamKey {
+            cnx: 0x1,
+            stream_id: 4,
+        };
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+
+        state.streams.insert(
+            key,
+            ServerStream {
+                write_tx: None,
+                data_rx: None,
+                send_pending: Some(Arc::new(AtomicBool::new(false))),
+                send_stash: None,
+                shutdown_tx,
+                tx_bytes: 0,
+                target_fin_pending: false,
+                close_after_flush: false,
+                pending_data: VecDeque::new(),
+                pending_fin: false,
+                fin_enqueued: false,
+                flow: FlowControlState::default(),
+            },
+        );
+
+        test_hooks::set_mark_active_stream_failures(1);
+
+        handle_command(
+            &mut state as *mut _,
+            Command::StreamClosed {
+                cnx_id: key.cnx,
+                stream_id: key.stream_id,
+            },
+        );
+
+        assert!(
+            !state.streams.contains_key(&key),
+            "stream state should be removed when mark_active_stream fails"
+        );
+    }
 }

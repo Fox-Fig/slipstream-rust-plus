@@ -3,6 +3,7 @@ use slipstream_core::flow_control::{
     overflow_log_message, promote_error_log_message, promote_streams, reserve_target_offset,
     FlowControlState, HasFlowControlState, PromoteEntry, StreamReceiveConfig, StreamReceiveOps,
 };
+use slipstream_core::invariants::InvariantReporter;
 use slipstream_core::tcp::{stream_read_limit_chunks, tcp_send_buffer_bytes};
 use slipstream_ffi::picoquic::{
     picoquic_add_to_stream, picoquic_call_back_event_t, picoquic_cnx_t, picoquic_current_time,
@@ -16,11 +17,12 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 use tokio::sync::{mpsc, oneshot, Notify};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 const STREAM_READ_CHUNK_BYTES: usize = 4096;
 const DEFAULT_TCP_RCVBUF_BYTES: usize = 256 * 1024;
 const CLIENT_WRITE_COALESCE_DEFAULT_BYTES: usize = 256 * 1024;
+static INVARIANT_REPORTER: InvariantReporter = InvariantReporter::new(1_000_000);
 
 pub(crate) struct ClientState {
     ready: bool,
@@ -164,6 +166,46 @@ impl ClientState {
         self.path_events.clear();
         self.debug_enqueued_bytes = 0;
         self.debug_last_enqueue_at = 0;
+    }
+}
+
+fn report_invariant<F>(message: F)
+where
+    F: FnOnce() -> String,
+{
+    let now = unsafe { picoquic_current_time() };
+    INVARIANT_REPORTER.report(now, message, |msg| error!("{}", msg));
+}
+
+fn check_stream_invariants(state: &ClientState, stream_id: u64, context: &str) {
+    let Some(stream) = state.streams.get(&stream_id) else {
+        return;
+    };
+    if stream.fin_enqueued && stream.data_rx.is_some() {
+        report_invariant(|| {
+            format!(
+                "client invariant violated: fin_enqueued with data_rx stream={} context={} queued={} fin_enqueued={} discarding={} tx_bytes={}",
+                stream_id,
+                context,
+                stream.flow.queued_bytes,
+                stream.fin_enqueued,
+                stream.flow.discarding,
+                stream.tx_bytes
+            )
+        });
+    }
+    if stream.fin_enqueued && stream.flow.queued_bytes == 0 && !stream.flow.discarding {
+        report_invariant(|| {
+            format!(
+                "client invariant violated: fin_enqueued with zero queue stream={} context={} queued={} fin_enqueued={} discarding={} rx_bytes={}",
+                stream_id,
+                context,
+                stream.flow.queued_bytes,
+                stream.fin_enqueued,
+                stream.flow.discarding,
+                stream.flow.rx_bytes
+            )
+        });
     }
 }
 
@@ -442,6 +484,8 @@ fn handle_stream_data(
         }
         state.streams.remove(&stream_id);
     }
+
+    check_stream_invariants(state, stream_id, "handle_stream_data");
 }
 
 pub(crate) fn spawn_acceptor(
@@ -461,6 +505,114 @@ pub(crate) fn spawn_acceptor(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod test_hooks {
+    use slipstream_core::test_support::FailureCounter;
+
+    pub(super) const FORCED_ADD_TO_STREAM_ERROR: i32 = -1;
+    pub(super) const FORCED_MARK_ACTIVE_STREAM_ERROR: i32 = 0x400 + 36;
+    pub(super) static ADD_TO_STREAM_FAILS_LEFT: FailureCounter = FailureCounter::new();
+    pub(super) static MARK_ACTIVE_STREAM_FAILS_LEFT: FailureCounter = FailureCounter::new();
+
+    pub(super) fn set_add_to_stream_failures(count: usize) {
+        ADD_TO_STREAM_FAILS_LEFT.set(count);
+    }
+
+    pub(super) fn set_mark_active_stream_failures(count: usize) {
+        MARK_ACTIVE_STREAM_FAILS_LEFT.set(count);
+    }
+
+    pub(super) fn take_add_to_stream_failure() -> bool {
+        ADD_TO_STREAM_FAILS_LEFT.take()
+    }
+
+    pub(super) fn take_mark_active_stream_failure() -> bool {
+        MARK_ACTIVE_STREAM_FAILS_LEFT.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slipstream_core::test_support::ResetOnDrop;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, oneshot, Notify};
+
+    #[test]
+    fn add_to_stream_fin_failure_removes_stream() {
+        let _guard = ResetOnDrop::new(|| test_hooks::set_add_to_stream_failures(0));
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let data_notify = Arc::new(Notify::new());
+        let mut state = ClientState::new(command_tx, data_notify, false);
+        let stream_id = 4;
+        let (write_tx, _write_rx) = mpsc::unbounded_channel();
+        let (read_abort_tx, _read_abort_rx) = oneshot::channel();
+
+        state.streams.insert(
+            stream_id,
+            ClientStream {
+                write_tx,
+                read_abort_tx: Some(read_abort_tx),
+                data_rx: None,
+                tx_bytes: 0,
+                fin_enqueued: false,
+                flow: FlowControlState::default(),
+            },
+        );
+
+        test_hooks::set_add_to_stream_failures(1);
+
+        handle_command(
+            std::ptr::null_mut(),
+            &mut state as *mut _,
+            Command::StreamClosed { stream_id },
+        );
+
+        assert!(
+            !state.streams.contains_key(&stream_id),
+            "stream state should be removed when add_to_stream(fin) fails"
+        );
+    }
+
+    #[test]
+    fn mark_active_stream_failure_removes_stream() {
+        let _guard = ResetOnDrop::new(|| test_hooks::set_mark_active_stream_failures(0));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let listener = TokioTcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            let addr = listener.local_addr().expect("listener addr");
+            let accept = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                stream
+            });
+            let _client = TokioTcpStream::connect(addr).await.expect("connect");
+            let stream = accept.await.expect("accept join");
+
+            let (command_tx, _command_rx) = mpsc::unbounded_channel();
+            let data_notify = Arc::new(Notify::new());
+            let mut state = ClientState::new(command_tx, data_notify, false);
+
+            test_hooks::set_mark_active_stream_failures(1);
+
+            handle_command(
+                std::ptr::null_mut(),
+                &mut state as *mut _,
+                Command::NewStream(stream),
+            );
+
+            assert!(
+                state.streams.is_empty(),
+                "stream state should be removed when mark_active_stream fails"
+            );
+        });
+    }
 }
 
 pub(crate) fn drain_commands(
@@ -504,6 +656,21 @@ pub(crate) fn handle_command(
             );
             let (data_tx, data_rx) = mpsc::channel(read_limit);
             let data_notify = state.data_notify.clone();
+            #[cfg(test)]
+            let forced_failure = test_hooks::take_mark_active_stream_failure();
+            #[cfg(not(test))]
+            let forced_failure = false;
+            #[cfg(test)]
+            let stream_id = if forced_failure {
+                4
+            } else {
+                assert!(
+                    !cnx.is_null(),
+                    "picoquic connection must be non-null when not forcing failures in tests"
+                );
+                unsafe { picoquic_get_next_local_stream_id(cnx, 0) }
+            };
+            #[cfg(not(test))]
             let stream_id = unsafe { picoquic_get_next_local_stream_id(cnx, 0) };
             let send_buffer_bytes = tcp_send_buffer_bytes(&stream)
                 .filter(|bytes| *bytes > 0)
@@ -561,12 +728,37 @@ pub(crate) fn handle_command(
                     },
                 );
             }
-            let _ = unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) };
+            #[cfg(test)]
+            let ret = if forced_failure {
+                test_hooks::FORCED_MARK_ACTIVE_STREAM_ERROR
+            } else {
+                unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) }
+            };
+            #[cfg(not(test))]
+            let ret =
+                unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) };
+            if ret != 0 {
+                warn!(
+                    "stream {}: mark_active_stream failed ret={}",
+                    stream_id, ret
+                );
+                if let Some(mut stream) = state.streams.remove(&stream_id) {
+                    if let Some(read_abort_tx) = stream.read_abort_tx.take() {
+                        let _ = read_abort_tx.send(());
+                    }
+                    let _ = stream.write_tx.send(StreamWrite::Fin);
+                }
+                if !forced_failure {
+                    unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+                }
+                return;
+            }
             if state.debug_streams {
                 debug!("stream {}: accepted", stream_id);
             } else {
                 debug!("Accepted TCP stream {}", stream_id);
             }
+            check_stream_invariants(state, stream_id, "NewStream");
         }
         Command::StreamData { stream_id, data } => {
             let ret =
@@ -587,15 +779,36 @@ pub(crate) fn handle_command(
                     state.debug_enqueued_bytes.saturating_add(data.len() as u64);
                 state.debug_last_enqueue_at = now;
             }
+            check_stream_invariants(state, stream_id, "StreamData");
         }
         Command::StreamClosed { stream_id } => {
+            #[cfg(test)]
+            let forced_failure = test_hooks::take_add_to_stream_failure();
+            #[cfg(not(test))]
+            let forced_failure = false;
+            #[cfg(test)]
+            let ret = if forced_failure {
+                test_hooks::FORCED_ADD_TO_STREAM_ERROR
+            } else {
+                assert!(
+                    !cnx.is_null(),
+                    "picoquic connection must be non-null when not forcing failures in tests"
+                );
+                unsafe { picoquic_add_to_stream(cnx, stream_id, std::ptr::null(), 0, 1) }
+            };
+            #[cfg(not(test))]
             let ret = unsafe { picoquic_add_to_stream(cnx, stream_id, std::ptr::null(), 0, 1) };
             if ret < 0 {
                 warn!(
                     "stream {}: add_to_stream(fin) failed ret={}",
                     stream_id, ret
                 );
+                if !forced_failure {
+                    unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+                }
+                state.streams.remove(&stream_id);
             }
+            check_stream_invariants(state, stream_id, "StreamClosed");
         }
         Command::StreamReadError { stream_id } => {
             if let Some(stream) = state.streams.remove(&stream_id) {
@@ -668,6 +881,7 @@ pub(crate) fn handle_command(
             if remove_stream {
                 state.streams.remove(&stream_id);
             }
+            check_stream_invariants(state, stream_id, "StreamWriteDrained");
         }
     }
 }
