@@ -51,6 +51,20 @@ pub(crate) struct ServerStreamMetrics {
     pub(crate) multi_stream: bool,
 }
 
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct BacklogStreamSummary {
+    pub(crate) stream_id: u64,
+    pub(crate) send_pending: bool,
+    pub(crate) send_stash_bytes: usize,
+    pub(crate) target_fin_pending: bool,
+    pub(crate) close_after_flush: bool,
+    pub(crate) pending_fin: bool,
+    pub(crate) fin_enqueued: bool,
+    pub(crate) queued_bytes: u64,
+    pub(crate) pending_chunks: usize,
+}
+
 impl ServerStreamMetrics {
     pub(crate) fn has_send_backlog(&self) -> bool {
         self.streams_with_send_pending > 0
@@ -146,6 +160,46 @@ impl ServerState {
             }
         }
         metrics
+    }
+
+    pub(crate) fn stream_send_backlog_summaries(
+        &self,
+        cnx_id: usize,
+        limit: usize,
+    ) -> Vec<BacklogStreamSummary> {
+        let mut summaries = Vec::new();
+        for (key, stream) in self.streams.iter() {
+            if key.cnx != cnx_id {
+                continue;
+            }
+            let send_pending = stream
+                .send_pending
+                .as_ref()
+                .map(|flag| flag.load(Ordering::SeqCst))
+                .unwrap_or(false);
+            let send_stash_bytes = stream
+                .send_stash
+                .as_ref()
+                .map(|data| data.len())
+                .unwrap_or(0);
+            if send_pending || send_stash_bytes > 0 || stream.target_fin_pending {
+                summaries.push(BacklogStreamSummary {
+                    stream_id: key.stream_id,
+                    send_pending,
+                    send_stash_bytes,
+                    target_fin_pending: stream.target_fin_pending,
+                    close_after_flush: stream.close_after_flush,
+                    pending_fin: stream.pending_fin,
+                    fin_enqueued: stream.fin_enqueued,
+                    queued_bytes: stream.flow.queued_bytes as u64,
+                    pending_chunks: stream.pending_data.len(),
+                });
+                if summaries.len() >= limit {
+                    break;
+                }
+            }
+        }
+        summaries
     }
 }
 

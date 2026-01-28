@@ -44,6 +44,21 @@ pub(crate) struct ClientStreamMetrics {
     pub(crate) streams_with_data_rx: usize,
 }
 
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct ClientBacklogSummary {
+    pub(crate) stream_id: u64,
+    pub(crate) queued_bytes: u64,
+    pub(crate) rx_bytes: u64,
+    pub(crate) consumed_offset: u64,
+    pub(crate) fin_offset: Option<u64>,
+    pub(crate) fin_enqueued: bool,
+    pub(crate) stop_sending_sent: bool,
+    pub(crate) discarding: bool,
+    pub(crate) has_data_rx: bool,
+    pub(crate) tx_bytes: u64,
+}
+
 impl ClientState {
     pub(crate) fn new(
         command_tx: mpsc::UnboundedSender<Command>,
@@ -100,6 +115,32 @@ impl ClientState {
             }
         }
         metrics
+    }
+
+    pub(crate) fn stream_backlog_summaries(&self, limit: usize) -> Vec<ClientBacklogSummary> {
+        let mut summaries = Vec::new();
+        for (stream_id, stream) in self.streams.iter() {
+            let queued_bytes = stream.flow.queued_bytes as u64;
+            let has_data_rx = stream.data_rx.is_some();
+            if queued_bytes > 0 || stream.fin_enqueued || stream.flow.discarding || has_data_rx {
+                summaries.push(ClientBacklogSummary {
+                    stream_id: *stream_id,
+                    queued_bytes,
+                    rx_bytes: stream.flow.rx_bytes,
+                    consumed_offset: stream.flow.consumed_offset,
+                    fin_offset: stream.flow.fin_offset,
+                    fin_enqueued: stream.fin_enqueued,
+                    stop_sending_sent: stream.flow.stop_sending_sent,
+                    discarding: stream.flow.discarding,
+                    has_data_rx,
+                    tx_bytes: stream.tx_bytes,
+                });
+                if summaries.len() >= limit {
+                    break;
+                }
+            }
+        }
+        summaries
     }
 
     pub(crate) fn take_path_events(&mut self) -> Vec<PathEvent> {
