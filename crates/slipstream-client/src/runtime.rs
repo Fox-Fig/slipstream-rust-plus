@@ -391,12 +391,21 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         )
                     };
 
+                    if ret != 0 {
+                        tracing::error!("picoquic_prepare_packet_ex failed with code {}", ret);
+                    }
+
                     if ret == 0 && send_length > 0 {
                         // Packet produced!
                         packet_produced = true;
                         // Rotate to next resolver for the next packet
                         current_resolver_index = (idx + 1) % resolver_count;
                         break; 
+                    } else if ret == 0 && i == resolver_count - 1 && resolver_count > 1 {
+                        // Log only if no packet produced after checking all resolvers
+                        // (To avoid spam, logic here is slightly imperfect but useful for now)
+                        // Actually better to log immediately if it fails?
+                        // tracing::trace!("No packet produced for resolver {}", idx);
                     }
                 }
 
@@ -431,21 +440,34 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     }
                 }
 
-                let qname = build_qname(&send_buf[..send_length], config.domain)
-                    .map_err(|err| ClientError::new(err.to_string()))?;
-                let params = QueryParams {
-                    id: dns_id,
-                    qname: &qname,
-                    qtype: RR_TXT,
-                    qclass: CLASS_IN,
-                    rd: true,
-                    cd: false,
-                    qdcount: 1,
-                    is_query: true,
+                // Adaptive MTU: Choose encoding based on packet size
+                // Small packets (<= 200 bytes): Use QNAME encoding (resilient mode)
+                // Large packets (> 200 bytes): Use EDNS0 OPT encoding (high-speed mode)
+                let packet = if send_length <= slipstream_dns::EDNS0_THRESHOLD {
+                    // QNAME encoding (legacy/resilient mode)
+                    let qname = build_qname(&send_buf[..send_length], config.domain)
+                        .map_err(|err| ClientError::new(err.to_string()))?;
+                    let params = QueryParams {
+                        id: dns_id,
+                        qname: &qname,
+                        qtype: RR_TXT,
+                        qclass: CLASS_IN,
+                        rd: true,
+                        cd: false,
+                        qdcount: 1,
+                        is_query: true,
+                    };
+                    encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?
+                } else {
+                    // EDNS0 OPT encoding (high-speed mode)
+                    slipstream_dns::build_query_with_edns0_payload(
+                        &send_buf[..send_length],
+                        config.domain,
+                        dns_id,
+                    )
+                    .map_err(|err| ClientError::new(err.to_string()))?
                 };
                 dns_id = dns_id.wrapping_add(1);
-                let packet =
-                    encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?;
 
                 let dest = sockaddr_storage_to_socket_addr(&addr_to)?;
                 let dest = normalize_dual_stack_addr(dest);
