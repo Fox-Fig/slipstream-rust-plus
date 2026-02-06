@@ -23,7 +23,7 @@
 %%{init: {'theme': 'dark'}}%%
 xychart-beta
     title "مقایسه سرعت دانلود (مگابایت بر ثانیه)"
-    x-axis [dnstt, Slipstream (C), Rust (Auth), Rust Plus]
+    x-axis ["dnstt", "Slipstream (C)", "Rust (Auth)", "Rust Plus"]
     y-axis "MB/s" 0..520
     bar [4.01, 9.12, 24.57, 512]
 ```
